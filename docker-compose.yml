@@ -1,0 +1,45 @@
+services:
+  site:
+    build:
+      context: .
+      dockerfile: site/Dockerfile
+    image: recall-notice-site:local
+    container_name: recall-site
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./site:/srv/site:ro
+      - site-state:/data/site
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8080/healthz').status==200 else 1)"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  collector:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: recall-collector:local
+    container_name: recall-collector
+    environment:
+      COLLECTOR_DB: /data/collector/collector.db
+      SITE_BASE_URL: http://site:8080
+    ports:
+      - "8000:8000"
+    volumes:
+      - collector-data:/data/collector
+    depends_on:
+      site:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/healthz').status==200 else 1)"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+volumes:
+  collector-data:
+  site-state:
