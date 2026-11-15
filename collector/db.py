@@ -344,6 +344,155 @@ class Database:
                 "root_notice_number": snap["root_notice_number"],
                 "notices": notices, "edges": edges}
 
+    # ---- 历史更正链（按已发布快照号还原时点视图） ------------------
+    def snapshot_exists(self, snapshot_id: int) -> bool:
+        row = self._conn.execute(
+            "SELECT 1 FROM snapshots WHERE id=? AND status='published'",
+            (snapshot_id,)).fetchone()
+        return row is not None
+
+    def _effective_snapshot_id(self, c, notice_number: str, as_of_snapshot_id: int) -> int | None:
+        """该通报在锚点快照发布时点的生效快照：
+        快照号 <= 锚点、且包含该通报的最近一次发布（快照号即发布顺序）。"""
+        row = c.execute(
+            """SELECT n.snapshot_id FROM notices n
+               JOIN snapshots s ON s.id=n.snapshot_id AND s.status='published'
+               WHERE n.notice_number=? AND n.snapshot_id<=?
+               ORDER BY n.snapshot_id DESC LIMIT 1""",
+            (notice_number, as_of_snapshot_id)).fetchone()
+        return None if row is None else int(row["snapshot_id"])
+
+    def _load_node(self, c, notice_number: str, snapshot_id: int, depth: int) -> dict:
+        notice = c.execute(
+            "SELECT * FROM notices WHERE snapshot_id=? AND notice_number=?",
+            (snapshot_id, notice_number)).fetchone()
+        snap = c.execute(
+            "SELECT site_revision FROM snapshots WHERE id=?", (snapshot_id,)).fetchone()
+        sources = [dict(r) for r in c.execute(
+            "SELECT url, title, fetched_at, content_hash FROM notice_sources "
+            "WHERE snapshot_id=? AND notice_id=? ORDER BY url",
+            (snapshot_id, notice["id"])).fetchall()]
+        batches = [dict(r) for r in c.execute(
+            "SELECT batch_number, source_url FROM notice_batches "
+            "WHERE snapshot_id=? AND notice_id=? ORDER BY batch_number, source_url",
+            (snapshot_id, notice["id"])).fetchall()]
+        return {
+            "notice_number": notice_number,
+            "depth": depth,
+            "snapshot_id": snapshot_id,
+            "site_revision": snap["site_revision"],
+            "content_hash": notice["content_hash"],
+            "sources": sources,
+            "batches": batches,
+        }
+
+    def get_historical_correction_chain(
+            self, snapshot_id: int, notice_number: str) -> dict | None:
+        """按已发布快照号（时点）与通报号还原历史更正链。
+
+        - 锚点快照不存在或未发布，或被查通报在该时点尚未发布 -> None；
+        - 每个通报取该时点最近一次发布且包含它的快照节点（跨入口共享通报取新图，
+          未被新图覆盖的沿用旧节点）；
+        - 沿生效节点快照内的“更正自”边 BFS，循环引用每个通报只展开一次；
+        - 目标在该时点尚未发布，或链接 target_url 不在目标节点当时的来源中，
+          标记为断链，不展开、不借用后来的来源或批号。
+        仅读取不可变的已发布快照，故与新采集交错及重启后结果一致。
+        """
+        conn = self._conn
+        anchor = conn.execute(
+            "SELECT * FROM snapshots WHERE id=? AND status='published'",
+            (snapshot_id,)).fetchone()
+        if anchor is None:
+            return None
+
+        # 只读取不可变的已发布快照：新发布只插入更大快照号，被 snapshot_id<=?
+        # 排除；已发布行永不更新/删除。故无需显式事务，WAL 下每条 SELECT 原子，
+        # 与新采集交错或进程重启后结果保持一致，也不会与写事务嵌套冲突。
+        root_sid = self._effective_snapshot_id(conn, notice_number, snapshot_id)
+        if root_sid is None:
+            return None
+
+        nodes: list[dict] = []
+        links: list[dict] = []
+        visited: set[str] = set()
+        # (通报号, 深度, 生效快照号)
+        queue: list[tuple[str, int, int]] = [(notice_number, 0, root_sid)]
+        visited.add(notice_number)
+        seen_links: set[tuple[str, str, str, str]] = set()
+
+        while queue:
+            current, depth, eff_sid = queue.pop(0)
+            nodes.append(self._load_node(conn, current, eff_sid, depth))
+            edges = conn.execute(
+                """SELECT from_notice, to_notice, source_url, target_url
+                   FROM notice_edges WHERE snapshot_id=? AND from_notice=?
+                   ORDER BY id""", (eff_sid, current)).fetchall()
+            for e in edges:
+                key = (e["from_notice"], e["to_notice"],
+                       e["source_url"], e["target_url"])
+                if key in seen_links:
+                    continue
+                seen_links.add(key)
+                target_sid = self._effective_snapshot_id(
+                    conn, e["to_notice"], snapshot_id)
+                if target_sid is None:
+                    # 目标在该时点尚未发布：断链，不借用后来的来源或批号
+                    links.append({
+                        "from_notice": e["from_notice"],
+                        "to_notice": e["to_notice"],
+                        "source_url": e["source_url"],
+                        "target_url": e["target_url"],
+                        "target_snapshot_id": None,
+                        "broken": True,
+                        "broken_reason": "target_not_published",
+                    })
+                    continue
+                target_sources = {
+                    r["url"] for r in conn.execute(
+                        "SELECT url FROM notice_sources WHERE snapshot_id=?",
+                        (target_sid,)).fetchall()}
+                if e["target_url"] not in target_sources:
+                    # 链接所指 URL 不在目标通报当时的来源中：断链。
+                    # 目标在该时点已发布，仍返回其“当时”节点（批号/来源/所属快照
+                    # 均为时点内数据，非借用后来数据），但不沿这条断链展开其出边；
+                    # 若目标还能经其他正常链接到达，仍会在那里正常展开。
+                    links.append({
+                        "from_notice": e["from_notice"],
+                        "to_notice": e["to_notice"],
+                        "source_url": e["source_url"],
+                        "target_url": e["target_url"],
+                        "target_snapshot_id": target_sid,
+                        "broken": True,
+                        "broken_reason": "target_url_not_in_sources",
+                    })
+                    if e["to_notice"] not in visited:
+                        visited.add(e["to_notice"])
+                        nodes.append(self._load_node(
+                            conn, e["to_notice"], target_sid, depth + 1))
+                    continue
+                links.append({
+                    "from_notice": e["from_notice"],
+                    "to_notice": e["to_notice"],
+                    "source_url": e["source_url"],
+                    "target_url": e["target_url"],
+                    "target_snapshot_id": target_sid,
+                    "broken": False,
+                    "broken_reason": None,
+                })
+                if e["to_notice"] not in visited:
+                    visited.add(e["to_notice"])
+                    queue.append((e["to_notice"], depth + 1, target_sid))
+
+        return {
+            "snapshot_id": snapshot_id,
+            "site_revision": anchor["site_revision"],
+            "root_notice_number": anchor["root_notice_number"],
+            "notice_number": notice_number,
+            "nodes": nodes,
+            "links": links,
+            "broken_link_count": sum(1 for l in links if l["broken"]),
+        }
+
     def list_runs(self, limit: int = 50) -> list[dict]:
         rows = self._conn.execute(
             "SELECT * FROM runs ORDER BY id DESC LIMIT ?", (limit,)).fetchall()

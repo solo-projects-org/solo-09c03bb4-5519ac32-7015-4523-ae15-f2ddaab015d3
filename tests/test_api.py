@@ -105,6 +105,74 @@ def test_unknown_notice_404_on_query(client):
     assert c.get("/notices/UNKNOWN").status_code == 404
 
 
+def test_historical_correction_chain_endpoint(client):
+    c, _, _ = client
+    # GOOD 夹具：N2 更正自 N1，N1 有两个来源 URL（主公告 + 镜像）
+    resp = c.post("/collect", json={"notice_number": "N2"})
+    assert resp.status_code == 200
+    sid = resp.json()["snapshot_id"]
+
+    chain = c.get(f"/snapshots/{sid}/notices/N2/correction-chain")
+    assert chain.status_code == 200
+    body = chain.json()
+    assert body["snapshot_id"] == sid
+    assert body["notice_number"] == "N2"
+    numbers = [n["notice_number"] for n in body["nodes"]]
+    assert numbers == ["N2", "N1"]
+    depths = {n["notice_number"]: n["depth"] for n in body["nodes"]}
+    assert depths == {"N2": 0, "N1": 1}
+    # N1 当时节点带批号、来源与所属快照
+    n1 = next(n for n in body["nodes"] if n["notice_number"] == "N1")
+    assert n1["snapshot_id"] == sid
+    assert n1["batches"][0]["batch_number"] == "B1"
+    assert {s["url"] for s in n1["sources"]} == {
+        "http://fake.test/notice/n1.html",
+        "http://fake.test/notice/n1_mirror.html"}
+    assert body["broken_link_count"] == 0
+    link = body["links"][0]
+    assert (link["from_notice"], link["to_notice"], link["broken"]) == ("N2", "N1", False)
+    assert link["target_snapshot_id"] == sid
+
+
+def test_historical_chain_404_for_bad_snapshot_and_unpublished_notice(client):
+    c, _, _ = client
+    assert c.post("/collect", json={"notice_number": "N2"}).status_code == 200
+    # 不存在的快照号
+    resp = c.get("/snapshots/99999/notices/N2/correction-chain")
+    assert resp.status_code == 404
+    assert "快照" in resp.json()["detail"]
+    # 快照存在但被查通报当时尚未发布
+    sid = c.get("/snapshots").json()[0]["id"]
+    resp = c.get(f"/snapshots/{sid}/notices/NOPE/correction-chain")
+    assert resp.status_code == 404
+    assert "尚未发布" in resp.json()["detail"]
+
+
+def test_historical_chain_stable_after_later_collect(client):
+    """历史查询与新采集交错：旧快照号的结果不被后来的发布改变。"""
+    c, fetcher, db = client
+    first = c.post("/collect", json={"notice_number": "N2"})
+    sid = first.json()["snapshot_id"]
+    before = c.get(f"/snapshots/{sid}/notices/N2/correction-chain").json()
+
+    # 再来一次采集（幂等 noop），并追加一个不相干种子的发布
+    c.post("/collect", json={"notice_number": "N2"})
+    extra = {
+        "/index.html": index_html([("N8", "/notice/n8.html")]),
+        "/notice/n8.html": notice_html("N8", "公告8", ["B8"]),
+    }
+    other = FakeFetcher({1: {p: FakePage(h, 1) for p, h in extra.items()}}, 1)
+    main_mod.app.state.fetcher = other
+    main_mod.app.state.service = CollectorService(db, other)
+    assert c.post("/collect", json={"notice_number": "N8"}).status_code == 200
+
+    after = c.get(f"/snapshots/{sid}/notices/N2/correction-chain").json()
+    assert after == before
+    # 现有最新查询照常
+    assert c.get("/notices/N2").status_code == 200
+    assert c.get("/graph").status_code == 200
+
+
 def test_openapi_contains_examples_and_tags(client):
     c, _, _ = client
     spec = c.get("/openapi.json").json()
@@ -112,4 +180,6 @@ def test_openapi_contains_examples_and_tags(client):
     schema = spec["components"]["schemas"]["CollectRequest"]
     assert "2024-003" in str(schema)
     declared_tags = {t["name"] for t in spec["tags"]}
-    assert {"采集", "查询", "审计", "运维"} <= declared_tags
+    assert {"采集", "查询", "历史查询", "审计", "运维"} <= declared_tags
+    assert "/snapshots/{snapshot_id}/notices/{notice_number}/correction-chain" \
+        in spec["paths"]

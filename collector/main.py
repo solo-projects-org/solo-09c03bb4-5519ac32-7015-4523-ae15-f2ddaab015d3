@@ -12,7 +12,8 @@ from fastapi.responses import JSONResponse
 
 from .db import Database
 from .fetcher import HttpFetcher
-from .models import AncestorView, CollectRequest, CollectResponse, NoticeView
+from .models import (AncestorView, CollectRequest, CollectResponse,
+                     HistoricalCorrectionChainView, NoticeView)
 from .service import CollectorService
 
 DB_PATH = os.environ.get("COLLECTOR_DB", "/data/collector/collector.db")
@@ -50,6 +51,7 @@ app = FastAPI(
     openapi_tags=[
         {"name": "采集", "description": "发起整次采集，失败一律不发布"},
         {"name": "查询", "description": "读取最新已发布图中的通报、批号与引用关系"},
+        {"name": "历史查询", "description": "按已发布快照号还原该次发布时点的历史更正链视图"},
         {"name": "审计", "description": "运行历史与快照版本历史"},
         {"name": "运维", "description": "健康检查"},
     ],
@@ -86,6 +88,40 @@ async def get_ancestors(notice_number: str) -> list[dict]:
     data = app.state.db.get_ancestors(notice_number)
     if data is None:
         raise HTTPException(status_code=404, detail=f"通报号 {notice_number} 尚未发布")
+    return data
+
+
+@app.get(
+    "/snapshots/{snapshot_id}/notices/{notice_number}/correction-chain",
+    response_model=HistoricalCorrectionChainView, tags=["历史查询"],
+    summary="按已发布快照号和通报号查询历史更正链（还原该次发布时点的公告视图）",
+    responses={
+        404: {"description": "快照号不存在/未发布，或被查通报在该时点尚未发布"},
+    },
+    description=(
+        "还原指定已发布快照发布后、各入口采集共同形成的公告视图，沿“更正自”关系"
+        "返回相关通报的批号、来源及所属快照。\n\n"
+        "时点语义：以路径中的快照号为时点，每个通报取该时点之前最近一次发布且"
+        "包含它的快照节点——不同入口的图共享通报时取最近发布的节点，未被新图"
+        "覆盖的通报沿用原值。\n\n"
+        "断链语义：链接所指 URL 不在目标通报当时的来源中，或目标在该时点尚未"
+        "发布，均标记 `broken=true` 并给出 `broken_reason`，不展开该链接，也不"
+        "借用后来的来源或批号；循环引用中的通报只列出一次。\n\n"
+        "历史结果只读取不可变的已发布快照，与新采集交错及服务重启后保持一致；"
+        "最新查询（/notices、/graph 等）行为不变。可用 GET /snapshots 取得快照号。"
+    ))
+async def get_historical_correction_chain(snapshot_id: int,
+                                           notice_number: str) -> dict:
+    if not app.state.db.snapshot_exists(snapshot_id):
+        raise HTTPException(
+            status_code=404,
+            detail=f"快照号 {snapshot_id} 不存在或未发布，可通过 GET /snapshots 查看")
+    data = app.state.db.get_historical_correction_chain(snapshot_id, notice_number)
+    if data is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"快照 {snapshot_id} 发布时点，通报号 {notice_number} 尚未发布，"
+                   "无法还原其历史更正链（不得借用后来的来源或批号）")
     return data
 
 

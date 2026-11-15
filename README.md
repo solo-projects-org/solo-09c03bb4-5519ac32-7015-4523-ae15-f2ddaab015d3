@@ -24,7 +24,7 @@
 │   ├── v1/                # 基线版本：更正链、同号镜像、循环引用样例
 │   ├── v2/                # 同号异文冲突样例（镜像正文被改写）
 │   └── v3/                # 链接失效样例（2024-001.html 被删除）
-├── tests/                 # 20 个单元/API/并发测试 + E2E 脚本
+├── tests/                 # 单元/API/并发/历史更正链测试 + E2E 脚本
 ├── Dockerfile / site/Dockerfile
 └── docker-compose.yml
 ```
@@ -67,6 +67,10 @@ curl localhost:8000/notices/2024-003/ancestors
 curl localhost:8000/graph
 curl localhost:8000/runs
 curl localhost:8000/snapshots
+
+# 5) 历史更正链：按“已发布快照号 + 通报号”还原该次发布时点的公告视图
+#    （快照号可先通过 GET /snapshots 取得，也可在 Swagger 中直接填写）
+curl localhost:8000/snapshots/1/notices/2024-003/correction-chain
 ```
 
 ## 四、关键正确性语义
@@ -84,6 +88,33 @@ curl localhost:8000/snapshots
 | 晚完成的旧版不能覆盖新版 | 发布事务内 CAS：同种子 revision 更小则 `StaleRevisionError` 拒绝 |
 | 重启读不到半张图 | 整张子图在单个 `BEGIN IMMEDIATE` 事务写入；启动清理 staging 残留；WAL |
 | 并发安全 | SQLite 单库 + IMMEDIATE 事务串行化发布；同版同内容幂等 noop |
+
+## 四点五、历史更正链 API（按快照号还原时点视图）
+
+药企数据员追查某次公告发布时，旧通报的**批号依据当时是否已经可用**，可调用：
+
+```
+GET /snapshots/{snapshot_id}/notices/{notice_number}/correction-chain
+```
+
+返回该次发布后各入口采集共同形成的公告视图，沿“更正自”关系给出相关通报的
+批号、来源 URL 及所属快照（`nodes`），以及每条引用边及其断链标记（`links`）。
+
+时点与断链语义：
+
+| 规则 | 说明 |
+| --- | --- |
+| 时点定义 | 以路径中的已发布快照号为时点；每个通报取“快照号 ≤ 该时点、且包含它”的最近一次发布节点 |
+| 跨入口共享通报 | 不同入口的图共享同一通报时，取该时点最近一次发布的节点 |
+| 未被新图覆盖 | 新图不包含的通报沿用其原有快照的批号、来源与所属快照 |
+| 断链：URL 不在来源中 | 链接所指 URL 不在目标通报**当时**的来源里：`broken=true`、`broken_reason=target_url_not_in_sources`，不沿该边展开，仍返回目标的当时节点 |
+| 断链：目标尚未发布 | 目标在该时点没有任何已发布快照：`broken_reason=target_not_published`、`target_snapshot_id=null`，不产生节点，**不得借用后来的来源或批号** |
+| 循环引用 | 环上每个通报只列出一次，引用边完整保留 |
+| 历史一致性 | 只读不可变的已发布快照（后来的快照号更大，被时点条件排除），与新采集交错及重启后结果完全一致；现有最新查询（`/notices`、`/graph` 等）行为不变 |
+
+`links[].broken_reason` 取值：`target_not_published`（目标尚未发布）、
+`target_url_not_in_sources`（链接 URL 不在目标当时来源中）。快照号不存在或未发布、
+被查通报在该时点尚未发布时返回 404，并在 `detail` 中说明原因。
 
 ## 五、内置样例
 
@@ -107,7 +138,7 @@ SITE_CONTENT_ROOT=./site SITE_STATE_DIR=./data/site SITE_PORT=8080 python site/s
 COLLECTOR_DB=./data/collector.db SITE_BASE_URL=http://127.0.0.1:8080 \
   uvicorn collector.main:app --reload --port 8000
 
-# 单元/API/并发测试（20 个，无需外部服务）
+# 单元/API/并发/历史链测试（无需外部服务）
 python -m pytest
 
 # 端到端矩阵（需先按上启动两个服务，默认地址 127.0.0.1:18080 / 18000）
